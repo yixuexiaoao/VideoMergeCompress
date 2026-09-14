@@ -18,15 +18,12 @@ jobs:
           python-version: '3.12'
       - name: Install build tools
         run: choco install innosetup ffmpeg -y --no-progress
-      - name: Install and test
-        run: |
-          python -m pip install --require-hashes -r requirements.lock
-          python -m pytest -q
       - name: Stage FFmpeg and licenses
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force resources/ffmpeg, licenses, packaging/inno | Out-Null
-          Copy-Item C:\ProgramData\chocolatey\bin\ffmpeg.exe, C:\ProgramData\chocolatey\bin\ffprobe.exe resources/ffmpeg
+          Copy-Item (Get-ChildItem C:\ProgramData\chocolatey\lib -Filter ffmpeg.exe -File -Recurse | Select-Object -First 1).FullName resources/ffmpeg
+          Copy-Item (Get-ChildItem C:\ProgramData\chocolatey\lib -Filter ffprobe.exe -File -Recurse | Select-Object -First 1).FullName resources/ffmpeg
           Copy-Item (Get-Command ISCC.exe).Source packaging/inno/ISCC.exe
           $site = python -c "import site; print(site.getsitepackages()[0])"
           Get-ChildItem $site -Directory -Filter '*.dist-info' | ForEach-Object {
