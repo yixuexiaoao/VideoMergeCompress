@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.test*/
+.extra-tests/
+build/
+dist/
+release/
+packaging/inno/
+packaging/wheels/
+packaging/*.exe
+resources/ffmpeg-full.7z
+resources/ffmpeg-*-full_build/
