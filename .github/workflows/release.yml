@@ -1,0 +1,47 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build tools
+        run: choco install innosetup ffmpeg -y --no-progress
+      - name: Install and test
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pytest -q
+      - name: Stage FFmpeg and licenses
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force resources/ffmpeg, licenses, packaging/inno | Out-Null
+          Copy-Item C:\ProgramData\chocolatey\bin\ffmpeg.exe, C:\ProgramData\chocolatey\bin\ffprobe.exe resources/ffmpeg
+          Copy-Item (Get-Command ISCC.exe).Source packaging/inno/ISCC.exe
+          $site = python -c "import site; print(site.getsitepackages()[0])"
+          Get-ChildItem $site -Directory -Filter '*.dist-info' | ForEach-Object {
+            if (Test-Path "$($_.FullName)\licenses") { Copy-Item "$($_.FullName)\licenses" "licenses\$($_.Name)" -Recurse }
+          }
+      - name: Build installer
+        shell: pwsh
+        run: .\build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VideoMergeCompress-installer
+          path: release/*.exe
+          if-no-files-found: error
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create ${{ github.ref_name }} release/*.exe --generate-notes
