@@ -1,7 +1,7 @@
 [Setup]
 AppId={{8DC85959-8D03-4F3B-A93C-D2F0D0A1D99C}
 AppName=VideoMergeCompress
-AppVersion=0.1.2
+AppVersion=0.1.3
 DefaultDirName={localappdata}\Programs\VideoMergeCompress
 DefaultGroupName=VideoMergeCompress
 PrivilegesRequired=lowest
@@ -9,7 +9,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 OutputDir=..\release
-OutputBaseFilename=VideoMergeCompress-0.1.2-Setup
+OutputBaseFilename=VideoMergeCompress-0.1.3-Setup
 Compression=lzma2/fast
 SolidCompression=yes
 WizardStyle=modern

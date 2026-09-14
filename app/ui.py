@@ -723,7 +723,7 @@ class MainWindow(QMainWindow):
         import sys
         root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent.parent))
         notices = root / 'THIRD_PARTY_NOTICES.md'
-        view.setMarkdown(notices.read_text(encoding='utf-8') if notices.exists() else '视频合并压缩 0.1.2 · 本地离线处理')
+        view.setMarkdown(notices.read_text(encoding='utf-8') if notices.exists() else '视频合并压缩 0.1.3 · 本地离线处理')
         layout.addWidget(view)
         dialog.exec()
 
