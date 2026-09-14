@@ -1,0 +1,2 @@
+GitHub Actions obtains FFmpeg from the Chocolatey ffmpeg package at build time.
+See THIRD_PARTY_NOTICES.md and resources/ffmpeg/LICENSE.txt for licensing details.
