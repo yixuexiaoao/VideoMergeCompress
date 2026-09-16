@@ -14,8 +14,9 @@ from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Si
 from platformdirs import user_state_path
 
 from .process_guard import ProcessGuard
+from .dual import DualEncode, dual_devices
 
-from .core import (Options, ProbeService, ProgressParser, atomic_json, build_command,
+from .core import (CPU_ENCODERS, encoder_codec, is_cpu, Options, ProbeService, ProgressParser, atomic_json, build_command,
                    create_plan, publish_without_overwrite, unique_output, validate_output)
 
 
@@ -100,6 +101,7 @@ class JobQueue(QObject):
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(4)
         self.jobs, self.active, self.paused, self.cancelled = [], None, False, False
+        self.nvenc_devices, self.dual, self.joining_dual = [], None, False
         self.guard = ProcessGuard()
         self.process = QProcess(self)
         self.process.started.connect(self.attach_process)
@@ -165,6 +167,7 @@ class JobQueue(QObject):
             self.idle.emit()
             return
         self.cancelled, self.retry_count, self.tail, self.max_progress = False, 0, '', 0.
+        self.joining_dual = False
         self.started = time.monotonic()
         self.progress.emit(0., '正在探测输入…')
         self.temp = self.root / self.active['id']
@@ -217,17 +220,59 @@ class JobQueue(QObject):
         self.launch()
 
     def launch(self):
+        self.joining_dual = False
         try:
+            devices = dual_devices(self.plan, self.nvenc_devices) if not self.retry_count else []
+            if len(devices) == 2:
+                self.state('RUNNING', gpu_devices=devices, encoder=self.plan.encoder)
+                self.message.emit(f'双 GPU #{devices[0]} / #{devices[1]} 同时编码两个连续区间；最后复制视频流拼接，音频只压缩一次。')
+                self.dual = DualEncode(self, devices)
+                self.dual.done.connect(self.dual_encoded)
+                self.dual.start()
+                return
+            if self.plan.options.dual_gpu and not self.retry_count:
+                self.message.emit('本任务使用单路处理：双卡要求两张通过相同 NVENC 自检的显卡、忽略字幕并烘焙方向；无损复制和 HDR 保留不使用双卡。')
             args, files = build_command(self.ffmpeg, self.plan, self.infos, self.temp, self.partial)
             for name, content in files.items():
                 (self.temp / name).write_text(content, encoding='utf-8')
             self.log.info('ExecutionPlan: %s; args: %s', self.plan.mode, json.dumps(args, ensure_ascii=False))
             self.state('RUNNING', plan=self.plan.mode, encoder=self.plan.encoder, retry=self.retry_count)
-            device = '无损流复制（无需 GPU）' if not self.plan.encoder else ('CPU · ' if self.plan.encoder.startswith('libx') else 'GPU · ') + self.plan.encoder
+            device = '无损流复制（无需 GPU）' if not self.plan.encoder else ('CPU · ' if is_cpu(self.plan.encoder) else 'GPU · ') + self.plan.encoder
             self.message.emit(self.plan.label + ' · ' + device)
             self.process.start(args[0], args[1:])
         except Exception as error:
             self.end('FAILED', str(error))
+
+    def dual_encoded(self, runner, error):
+        if self.cancelled or error:
+            self.dual_ready(None, error)
+            return
+        self.state('PLANNING')
+        self.work = background(self.pool, runner.validate_sections, self.dual_ready)
+
+    def dual_ready(self, args, error):
+        runner, self.dual = self.dual, None
+        runner.deleteLater()
+        if self.cancelled:
+            self.end('CANCELLED')
+        elif error:
+            self.log.error('Dual GPU failure: %s', error)
+            if not self.plan.options.keep_temp and runner.folder.is_dir():
+                try:
+                    shutil.rmtree(runner.folder)
+                except OSError as cleanup_error:
+                    self.message.emit(f'双卡临时文件清理失败：{cleanup_error}')
+            # Retry only after both child processes have stopped.
+            self.retry_count = 1
+            self.message.emit('双卡处理未完成，自动改为单路编码：' + error[:350])
+            self.launch()
+        else:
+            self.joining_dual = True
+            self.parser = ProgressParser(sum(i.duration_us for i in self.infos))
+            self.state('RUNNING')
+            self.message.emit('两张卡已完成编码，正在拼接视频流并压缩音频…')
+            self.log.info('Dual GPU stream-copy assembly: %s', args)
+            self.process.start(args[0], args[1:])
 
     def attach_process(self):
         try:
@@ -241,9 +286,13 @@ class JobQueue(QObject):
         if not self.active or not hasattr(self, 'parser'):
             return
         for fraction, speed, eta in self.parser.feed(chunk):
+            if self.joining_dual:
+                fraction = .9 + fraction * .08
             self.max_progress = max(self.max_progress, fraction)
             elapsed = time.monotonic() - self.started
-            device = '流复制' if not self.plan.encoder else ('CPU' if self.plan.encoder.startswith('libx') else 'GPU') + ' · ' + self.plan.encoder
+            device = '流复制' if not self.plan.encoder else ('CPU' if is_cpu(self.plan.encoder) else 'GPU') + ' · ' + self.plan.encoder
+            if self.joining_dual:
+                device = '双卡编码已完成 · 视频流拼接 / 音频压缩'
             detail = f'已用 {elapsed:.0f} 秒  ·  {speed:.1f}×' if speed else f'已用 {elapsed:.0f} 秒'
             detail += f'  ·  剩余约 {eta:.0f} 秒' if eta is not None and elapsed > 3 else '  ·  剩余时间计算中'
             self.progress.emit(self.max_progress, device + ' · ' + detail)
@@ -263,8 +312,10 @@ class JobQueue(QObject):
             return
         self.cancelled = True
         self.state('CANCELLING')
+        if self.dual and not self.dual.completed:
+            self.dual.stop()
         if self.process.state() != QProcess.ProcessState.NotRunning:
-            self.process.write(b'q\n')
+            self.process.kill()
             self.kill_timer.start(5000)
 
     def finished(self, code, status):
@@ -285,12 +336,12 @@ class JobQueue(QObject):
     def fail_or_retry(self, detail):
         lower = detail.lower()
         fatal = any(s in lower for s in ('no space left', 'permission denied', 'no such file', 'input/output error'))
-        hardware = self.plan.encoder and not self.plan.encoder.startswith('libx') and any(s in lower for s in ('encoder', 'device', 'driver', 'cuda', 'qsv', 'amf', 'initialize'))
+        hardware = self.plan.encoder and not is_cpu(self.plan.encoder) and any(s in lower for s in ('encoder', 'device', 'driver', 'cuda', 'qsv', 'amf', 'initialize'))
         direct = self.plan.mode != 'filter_concat_encode' and any(s in lower for s in ('timestamp', 'non-monoton', 'invalid data', 'dts', '校验'))
         if not self.retry_count and not fatal and (hardware or direct):
             try:
-                codec = 'hevc' if self.plan.encoder and ('hevc' in self.plan.encoder or self.plan.encoder == 'libx265') else self.plan.options.codec
-                o = replace(self.plan.options, encoder='libx265' if codec == 'hevc' else 'libx264', codec=codec)
+                codec = encoder_codec(self.plan.encoder) if self.plan.encoder else 'h264'
+                o = replace(self.plan.options, encoder=CPU_ENCODERS[codec], codec=codec)
                 self.plan = create_plan(self.infos, o, self.capabilities, force_filter=bool(direct))
                 self.partial.unlink(missing_ok=True)
                 self.retry_count = 1
@@ -344,6 +395,12 @@ class JobQueue(QObject):
             self.paused = True
             self.message.emit(f'任务记录无法保存，请检查磁盘：{save_error}')
         if not record['options'].get('keep_temp'):
+            dual_folder = self.temp / 'dual'
+            if dual_folder.is_dir():
+                try:
+                    shutil.rmtree(dual_folder)
+                except OSError as cleanup_error:
+                    self.message.emit(f'双卡临时文件未能清理：{cleanup_error}')
             for name in ('concat.ffconcat', 'filters.txt'):
                 try:
                     (self.temp / name).unlink(missing_ok=True)

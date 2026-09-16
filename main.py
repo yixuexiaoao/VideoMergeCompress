@@ -21,7 +21,7 @@ def main():
     app = QApplication(sys.argv)
     app.setFont(QFont('Microsoft YaHei UI', 10))
     app.setApplicationName('VideoMergeCompress')
-    app.setApplicationVersion('0.1.3')
+    app.setApplicationVersion('0.1.7')
     state = user_state_path('VideoMergeCompress', appauthor=False)
     state.mkdir(parents=True, exist_ok=True)
     lock = QLockFile(str(state / 'app.lock'))

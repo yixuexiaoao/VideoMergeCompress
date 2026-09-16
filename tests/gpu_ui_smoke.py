@@ -23,14 +23,14 @@ w.import_paths([str(Path('.gui-validation/sample000.mp4').resolve())])
 wait(lambda:w.start_button.isEnabled())
 w.preset.setCurrentIndex(w.preset.findData('compact'))
 w.update_plan()
-assert 'GPU · hevc_nvenc' in w.strategy.text(), w.strategy.text()
+assert 'h264_nvenc' in w.strategy.text(), w.strategy.text()
 queue=w.queue
 report['available']=['libx264','libx265']
 w.recheck_gpu()
 wait(lambda:not w.gpu_checking)
 assert w.queue is queue
 assert 'GPU 不可用' in w.gpu_status.text()
-assert 'CPU · libx265' in w.strategy.text()
+assert 'CPU · libx264' in w.strategy.text()
 def fail(self):raise RuntimeError('simulated detection failure')
 ui.MainWindow.initialize=fail
 w.recheck_gpu()

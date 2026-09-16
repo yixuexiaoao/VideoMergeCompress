@@ -5,12 +5,12 @@ import app.core as core
 from test_core import media
 
 
-@pytest.mark.parametrize('preset,expected',[('fast','h264_nvenc'),('balanced','h264_nvenc'),('compact','hevc_nvenc')])
+@pytest.mark.parametrize('preset,expected',[('fast','h264_nvenc'),('balanced','h264_nvenc'),('compact','h264_nvenc')])
 def test_gpu_priority_for_all_presets(preset, expected):
     capabilities=['libx264','libx265','h264_nvenc','hevc_nvenc']
     assert core.create_plan([media()],core.Options(preset=preset),capabilities).encoder == expected
     cpu=core.create_plan([media()],core.Options(preset=preset,prefer_gpu=False),capabilities)
-    assert cpu.encoder == ('libx265' if preset=='compact' else 'libx264')
+    assert cpu.encoder == 'libx264'
     explicit=core.create_plan([media()],core.Options(preset=preset,encoder='libx264'),capabilities)
     assert explicit.encoder=='libx264'
 

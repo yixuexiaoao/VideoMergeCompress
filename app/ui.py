@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import time
-from dataclasses import asdict, fields
+from functools import cmp_to_key
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QThreadPool, QTimer, QUrl, Signal, QCollator, QLocale, QItemSelectionModel
 from PySide6.QtGui import QDesktopServices, QStandardItem, QStandardItemModel, QColor
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QInputDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter, QTableView, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget, QHeaderView, QDialog, QTextBrowser)
 from platformdirs import user_config_path
 
-from .core import EXTENSIONS, Options, ProbeService, atomic_json, create_plan, discover_capabilities, rotation, tool_path, publish_without_overwrite
+from .core import is_cpu, encoder_codec, estimate_bytes, sample_estimate, EXTENSIONS, Options, ProbeService, atomic_json, create_plan, discover_capabilities, rotation, tool_path, publish_without_overwrite, output_requests, template_options
+from .profiles import read_profile, save_profile
+from .dual import dual_devices
 from .jobs import JobQueue, background
 from .gpu import gpu_report, diagnostic_summary
 
@@ -97,6 +101,15 @@ class MainWindow(QMainWindow):
             bar.addWidget(button)
         bar.addStretch()
         layout.addLayout(bar)
+        order_bar = QHBoxLayout()
+        self.order_buttons = {}
+        for text, action in [('文件名升序', lambda: self.sort_inputs(False)), ('文件名降序', lambda: self.sort_inputs(True)), ('移动到序号…', self.move_to)]:
+            button = QPushButton(text)
+            button.clicked.connect(lambda checked=False, action=action: action())
+            self.order_buttons[text] = button
+            order_bar.addWidget(button)
+        order_bar.addWidget(QLabel('文件名按数字自然排序；多选后可整体移动到指定位置。'), 1)
+        layout.addLayout(order_bar)
         self.table = InputTable()
         self.table.setModel(self.model)
         self.table.imported.connect(self.import_paths)
@@ -105,7 +118,10 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, 3)
         output_row = QHBoxLayout()
-        output_row.addWidget(QLabel('输出文件'))
+        self.operation = combo([('合并并压缩', 'merge'), ('独立压缩（每个视频单独输出）', 'compress')])
+        output_row.addWidget(self.operation)
+        self.output_label = QLabel('输出文件')
+        output_row.addWidget(self.output_label)
         self.output = QLineEdit()
         self.output.setAccessibleName('输出文件路径')
         output_row.addWidget(self.output)
@@ -114,10 +130,11 @@ class MainWindow(QMainWindow):
         output_row.addWidget(browse)
         layout.addLayout(output_row)
         settings = QHBoxLayout()
-        self.preset = combo([('保持原质量（无损）', 'copy'), ('极速', 'fast'), ('均衡', 'balanced'), ('高压缩', 'compact'), ('自定义', 'custom')])
+        self.preset = combo([('保持原质量（无损）', 'copy'), ('极速', 'fast'), ('均衡压缩（推荐）', 'balanced'), ('高清压缩', 'best'), ('极致轻量', 'compact'), ('自定义', 'custom')])
         self.preset.setCurrentIndex(2)
+        self.preset.setToolTip('高清 CRF 23 / 均衡 CRF 26 / 轻量 CRF 28；H.264 veryfast、AAC 128k，默认保留尺寸和帧率。GPU 使用相应 CQ，效果不与 CPU CRF 等同；体积和画质因素材而异。')
         self.container = combo([('MP4', 'mp4'), ('MKV', 'mkv')])
-        self.codec = combo([('自动', 'auto'), ('H.264', 'h264'), ('H.265 / HEVC', 'hevc')])
+        self.codec = combo([('自动', 'auto'), ('H.264', 'h264'), ('H.265 / HEVC', 'hevc'), ('AV1', 'av1')])
         self.resolution = combo([('保持', 0), ('2160p', 2160), ('1440p', 1440), ('1080p', 1080), ('720p', 720), ('自定义', -1)])
         self.fps = QLineEdit()
         self.fps.setPlaceholderText('自动 / 30 / 30000/1001')
@@ -126,6 +143,18 @@ class MainWindow(QMainWindow):
             widget.setAccessibleName(label)
             settings.addWidget(widget)
         layout.addLayout(settings)
+        profile_row = QHBoxLayout()
+        self.saved_profiles = QComboBox()
+        self.saved_profiles.setAccessibleName('已保存的自定义配置')
+        profile_row.addWidget(self.saved_profiles, 1)
+        self.profile_buttons = {}
+        for label, action in [('应用配置', self.apply_saved_profile), ('保存为自定义配置', self.save_custom_profile),
+                              ('导入参数', self.import_profile), ('导出参数', self.export_profile)]:
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, action=action: action())
+            self.profile_buttons[label] = button
+            profile_row.addWidget(button)
+        layout.addLayout(profile_row)
         self.advanced_toggle = QCheckBox('高级设置')
         self.advanced = QWidget()
         advanced_row = QHBoxLayout(self.advanced)
@@ -133,14 +162,15 @@ class MainWindow(QMainWindow):
         advanced_row.addLayout(left)
         advanced_row.addLayout(right)
         self.encoder = combo([('自动选择', 'auto')])
+        self.encoder_speed = combo([('跟随压缩级别', 'auto'), ('快速', 'fast'), ('均衡', 'balanced'), ('精细（更慢）', 'compact')])
         self.width, self.height = spin(16, 16384, 1920), spin(16, 16384, 1080)
         dimensions = QHBoxLayout()
         dimensions.addWidget(self.width)
         dimensions.addWidget(QLabel('×'))
         dimensions.addWidget(self.height)
         self.quality_mode = combo([('恒定质量', 'quality'), ('目标码率 kbps', 'bitrate'), ('目标大小 MiB（估算）', 'size')])
-        self.quality, self.bitrate, self.target_mib = spin(0, 51, 23), spin(100, 1000000, 4000), spin(1, 10000000, 100)
-        self.audio_bitrate = spin(64, 512, 160)
+        self.quality, self.bitrate, self.target_mib = spin(0, 63, 26), spin(100, 1000000, 4000), spin(1, 10000000, 100)
+        self.audio_bitrate = spin(64, 512, 128)
         self.sample_rate = combo([('48 kHz', 48000), ('44.1 kHz', 44100)])
         self.keep_channels = QCheckBox('保持第一段声道布局')
         self.subtitle_mode = combo([('忽略字幕', 'ignore'), ('复制兼容字幕', 'copy'), ('烧录文本字幕轨', 'burn')])
@@ -148,8 +178,8 @@ class MainWindow(QMainWindow):
         self.rotation_mode = combo([('烘焙显示方向', 'bake'), ('仅保留元数据', 'metadata')])
         self.hdr_mode = combo([('检测到 HDR 时阻止并提示', 'ask'), ('保留 HDR · HEVC Main10', 'preserve'), ('色调映射为 SDR', 'sdr')])
         self.keep_temp = QCheckBox('保留任务临时文件')
-        for label, widget in [('编码器', self.encoder), ('自定义宽高', dimensions), ('码率模式', self.quality_mode),
-                              ('质量 0–51（越小越清晰）', self.quality), ('视频码率 kbps', self.bitrate), ('目标大小 MiB', self.target_mib), ('音频码率 kbps', self.audio_bitrate)]:
+        for label, widget in [('编码器', self.encoder), ('编码速度', self.encoder_speed), ('自定义宽高', dimensions), ('码率模式', self.quality_mode),
+                              ('质量（AV1 0–63，其余 0–51）', self.quality), ('视频码率 kbps', self.bitrate), ('目标大小 MiB', self.target_mib), ('音频码率 kbps', self.audio_bitrate)]:
             left.addRow(label, widget)
         for label, widget in [('音频采样率', self.sample_rate), ('声道', self.keep_channels), ('字幕策略', self.subtitle_mode),
                               ('字幕轨序号（从 0 起）', self.subtitle_track), ('旋转策略', self.rotation_mode), ('HDR 策略', self.hdr_mode), ('临时文件', self.keep_temp)]:
@@ -167,6 +197,10 @@ class MainWindow(QMainWindow):
         self.prefer_gpu.setChecked(True)
         self.prefer_gpu.setToolTip('自动编码器在极速、均衡和高压缩中优先使用通过自检的 GPU；手动指定编码器优先。HDR 保留仍使用 CPU。')
         gpu_row.addWidget(self.prefer_gpu)
+        self.dual_gpu = QCheckBox('双 GPU 同时编码')
+        self.dual_gpu.setChecked(True)
+        self.dual_gpu.setToolTip('两张 NVIDIA 显卡分别编码同一任务的两个连续区间，再无重压拼接视频。启动时逐卡试编码；不适用时自动单路处理。临时无损音频会占用磁盘。')
+        gpu_row.addWidget(self.dual_gpu)
         self.gpu_recheck = QPushButton('重新检测 GPU')
         self.gpu_recheck.setEnabled(False)
         self.gpu_recheck.clicked.connect(self.recheck_gpu)
@@ -179,6 +213,14 @@ class MainWindow(QMainWindow):
         self.strategy = QLabel('正在检查 FFmpeg 和本机编码器…')
         self.strategy.setWordWrap(True)
         layout.addWidget(self.strategy)
+        self.size_estimate = QLabel('预计输出容量：请先添加视频')
+        self.size_estimate.setWordWrap(True)
+        self.size_estimate.setAccessibleName('预计输出容量')
+        layout.addWidget(self.size_estimate)
+        self.estimate_key, self.estimate_busy = None, False
+        self.estimate_timer = QTimer(self)
+        self.estimate_timer.setSingleShot(True)
+        self.estimate_timer.timeout.connect(self.start_estimate)
         progress_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1000)
@@ -226,7 +268,9 @@ class MainWindow(QMainWindow):
         self.log_view.setMaximumBlockCount(200)
         self.log_view.setMaximumHeight(80)
         layout.addWidget(self.log_view)
+        self.refresh_profiles()
         self.load_config()
+        self.operation_changed()
         self.quality.setEnabled(self.preset.currentData() == 'custom')
         self.update_timer = QTimer(self)
         self.update_timer.setSingleShot(True)
@@ -235,12 +279,15 @@ class MainWindow(QMainWindow):
             widget.currentIndexChanged.connect(lambda: self.update_timer.start(100))
         for widget in root.findChildren(QSpinBox):
             widget.valueChanged.connect(lambda: self.update_timer.start(100))
-        for widget in (self.prefer_gpu, self.keep_channels):
+        for widget in (self.prefer_gpu, self.dual_gpu, self.keep_channels):
             widget.toggled.connect(lambda: self.update_timer.start(100))
         self.fps.textChanged.connect(lambda: self.update_timer.start(100))
         self.model.rowsInserted.connect(lambda: self.update_timer.start(100))
         self.model.rowsRemoved.connect(lambda: self.update_timer.start(100))
         self.preset.currentIndexChanged.connect(self.preset_changed)
+        self.operation.currentIndexChanged.connect(self.operation_changed)
+        self.codec.currentIndexChanged.connect(self.codec_changed)
+        self.encoder.currentIndexChanged.connect(self.encoder_changed)
         self.works.append(background(self.pool, self.initialize, self.initialized))
 
     def initialize(self):
@@ -255,6 +302,7 @@ class MainWindow(QMainWindow):
             self.capabilities = []
             if self.queue:
                 self.queue.capabilities = []
+                self.queue.nvenc_devices = []
             self.start_button.setEnabled(False)
             self.gpu_diagnostics = {'checkedAt': time.strftime('%Y-%m-%d %H:%M:%S'), 'error': error}
             self.gpu_details.setEnabled(True)
@@ -270,10 +318,10 @@ class MainWindow(QMainWindow):
         self.encoder.clear()
         self.encoder.addItem('自动选择', 'auto')
         for encoder in self.capabilities:
-            self.encoder.addItem(('CPU · ' if encoder.startswith('libx') else 'GPU · ') + encoder, encoder)
+            self.encoder.addItem(('CPU · ' if is_cpu(encoder) else 'GPU · ') + encoder, encoder)
         self.encoder.setCurrentIndex(max(0, self.encoder.findData(selected)))
         self.encoder.blockSignals(False)
-        hardware = [e for e in self.capabilities if not e.startswith('libx')]
+        hardware = [e for e in self.capabilities if not is_cpu(e)]
         if hardware:
             self.gpu_status.setText('GPU 可用：' + '、'.join(hardware))
         else:
@@ -293,6 +341,14 @@ class MainWindow(QMainWindow):
             self.queue.idle.connect(self.on_idle)
         else:
             self.queue.capabilities = self.capabilities
+        self.queue.nvenc_devices = self.gpu_diagnostics.get('nvencDevices', [])
+        for encoder in ('h264_nvenc', 'hevc_nvenc', 'av1_nvenc'):
+            devices = [str(d['index']) for d in self.queue.nvenc_devices if encoder in d.get('encoders', [])]
+            if devices:
+                text = encoder + ' 逐卡试编码通过：GPU #' + ' / #'.join(devices)
+                self.log_view.appendPlainText(text)
+                if len(devices) >= 2:
+                    self.gpu_status.setText(self.gpu_status.text() + f'；{encoder} 双卡可用')
         self.log_view.appendPlainText('显卡 / 驱动：' + '；'.join(self.gpu_diagnostics['devices']))
         self.log_view.appendPlainText('编码器自检完成：' + '、'.join(self.capabilities))
         for note in diagnostic_summary(self.gpu_diagnostics):
@@ -339,13 +395,140 @@ class MainWindow(QMainWindow):
         layout.addLayout(controls)
         dialog.exec()
 
+    def refresh_profiles(self):
+        self.saved_profiles.clear()
+        folder = self.config_path.parent / 'profiles'
+        for path in sorted(folder.glob('*.json')):
+            try:
+                name, _ = read_profile(path)
+                self.saved_profiles.addItem(name, str(path))
+            except (OSError, ValueError, TypeError):
+                continue
+        self.profile_buttons['应用配置'].setEnabled(self.saved_profiles.count() > 0)
+
+    def profile_options(self):
+        options = template_options(self.options())
+        if options.preset == 'copy':
+            raise ValueError('请先选择一个压缩级别')
+        if options.preset != 'custom':
+            try:
+                infos = self.ordered_infos()
+            except ValueError:
+                infos = []
+            if infos:
+                plan = create_plan(infos[:1] if options.operation == 'compress' else infos, options, self.capabilities)
+                options = replace(plan.options, width=plan.width, height=plan.height, fps=plan.fps,
+                                  bitrate=plan.bitrate or options.bitrate,
+                                  codec=encoder_codec(plan.encoder))
+        return replace(options, preset='custom')
+
+    def apply_profile(self, name, options):
+        for field in fields(options):
+            widget = getattr(self, field.name, None)
+            if widget is None:
+                continue
+            value = getattr(options, field.name)
+            widget.blockSignals(True)
+            try:
+                if isinstance(widget, QComboBox):
+                    if field.name == 'encoder' and widget.findData(value) < 0:
+                        widget.addItem(value + '（本机不可用，将回退）', value)
+                    widget.setCurrentIndex(widget.findData(value))
+                elif isinstance(widget, QCheckBox): widget.setChecked(value)
+                elif isinstance(widget, QSpinBox): widget.setValue(value)
+                elif isinstance(widget, QLineEdit): widget.setText(value)
+            finally:
+                widget.blockSignals(False)
+        self.resolution.setCurrentIndex(self.resolution.findData(-1 if options.width else 0))
+        self.quality.setEnabled(True)
+        self.advanced_toggle.setChecked(True)
+        self.operation_changed()
+        self.update_plan()
+        atomic_json(self.config_path, {'schemaVersion': 1, 'output': asdict(options)})
+        self.log_view.appendPlainText('已应用自定义配置：' + name)
+
+    def save_custom_profile(self):
+        try:
+            options = self.profile_options()
+            name, ok = QInputDialog.getText(self, '保存自定义配置', '配置名称（同名更新）：')
+            if not ok: return
+            path = self.config_path.parent / 'profiles' / (hashlib.sha256(name.strip().encode('utf-8')).hexdigest() + '.json')
+            save_profile(path, name, options)
+            self.refresh_profiles()
+            self.saved_profiles.setCurrentIndex(self.saved_profiles.findData(str(path)))
+            self.apply_profile(name, options)
+        except (OSError, ValueError, TypeError) as error:
+            QMessageBox.warning(self, '保存配置失败', str(error))
+
+    def apply_saved_profile(self):
+        path = self.saved_profiles.currentData()
+        if not path: return
+        try:
+            self.apply_profile(*read_profile(path))
+        except (OSError, ValueError, TypeError) as error:
+            QMessageBox.warning(self, '应用配置失败', str(error))
+
+    def import_profile(self):
+        path, _ = QFileDialog.getOpenFileName(self, '导入压缩参数', '', '压缩配置 (*.json)')
+        if not path: return
+        try:
+            name, options = read_profile(path)
+            destination = self.config_path.parent / 'profiles' / (hashlib.sha256(name.encode('utf-8')).hexdigest() + '.json')
+            save_profile(destination, name, options)
+            self.refresh_profiles()
+            self.saved_profiles.setCurrentIndex(self.saved_profiles.findData(str(destination)))
+            self.apply_profile(name, options)
+        except (OSError, ValueError, TypeError) as error:
+            QMessageBox.warning(self, '导入失败', str(error))
+
+    def export_profile(self):
+        try:
+            options = self.profile_options()
+            path, _ = QFileDialog.getSaveFileName(self, '导出压缩参数', '压缩配置.json', '压缩配置 (*.json)')
+            if path:
+                save_profile(Path(path), self.saved_profiles.currentText() or '自定义压缩', options)
+                self.log_view.appendPlainText('压缩参数已导出')
+        except (OSError, ValueError, TypeError) as error:
+            QMessageBox.warning(self, '导出失败', str(error))
+
+    def operation_changed(self):
+        compress = self.operation.currentData() == 'compress'
+        self.output_label.setText('输出文件夹' if compress else '输出文件')
+        self.output.setAccessibleName('输出文件夹' if compress else '输出文件路径')
+        value = self.output.text().strip()
+        if value:
+            path = Path(value)
+            if compress and not path.is_dir():
+                self.output.setText(str(path.parent))
+            elif not compress and path.is_dir():
+                self.output.setText(str(path / time.strftime('merged_%Y%m%d_%H%M%S.mp4')))
+        if compress and self.preset.currentData() == 'copy':
+            self.preset.setCurrentIndex(self.preset.findData('balanced'))
+
+    def codec_changed(self):
+        if self.codec.currentData() not in ('auto', 'h264') and self.preset.currentData() in ('best', 'balanced', 'compact'):
+            self.preset.setCurrentIndex(self.preset.findData('custom'))
+        selected = self.encoder.currentData()
+        if selected != 'auto' and self.codec.currentData() != encoder_codec(selected):
+            self.encoder.setCurrentIndex(0)
+
+    def encoder_changed(self):
+        selected = self.encoder.currentData()
+        if selected != 'auto':
+            self.codec.setCurrentIndex(self.codec.findData(encoder_codec(selected)))
+
     def preset_changed(self):
         preset = self.preset.currentData()
         if preset != 'custom':
-            self.codec.setCurrentIndex(2 if preset == 'compact' else 0)
+            self.codec.setCurrentIndex(self.codec.findData('h264' if preset in ('best', 'balanced', 'compact') else 'auto'))
             self.encoder.setCurrentIndex(0)
-            self.quality.setValue(28 if preset == 'compact' else 23)
+            self.encoder_speed.setCurrentIndex(0)
+            self.quality.setValue({'best':23, 'balanced':26, 'compact':28}.get(preset,23))
+            self.audio_bitrate.setValue(128)
+            self.quality_mode.setCurrentIndex(self.quality_mode.findData('quality'))
         self.quality.setEnabled(preset == 'custom')
+        if preset == 'custom':
+            self.advanced_toggle.setChecked(True)
 
     def load_config(self):
         try:
@@ -359,7 +542,7 @@ class MainWindow(QMainWindow):
             for f in fields(Options):
                 if f.name not in values:
                     continue
-                trial = Options()
+                trial = Options(codec=values.get('codec', 'auto'), encoder=values.get('encoder', 'auto'))
                 setattr(trial, f.name, values[f.name])
                 if f.name not in ('width', 'height'):
                     try:
@@ -447,7 +630,7 @@ class MainWindow(QMainWindow):
             if self.queue:
                 self.schedule_probe(Path(value))
         if fresh and not self.output.text():
-            self.output.setText(str(Path(fresh[0]).parent / time.strftime('merged_%Y%m%d_%H%M%S.mp4')))
+            self.output.setText(str(Path(fresh[0]).parent if self.operation.currentData() == 'compress' else Path(fresh[0]).parent / time.strftime('merged_%Y%m%d_%H%M%S.mp4')))
         self.update_plan()
 
     def schedule_probe(self, path):
@@ -499,23 +682,119 @@ class MainWindow(QMainWindow):
     def update_plan(self):
         try:
             if not self.queue or self.gpu_checking:
+                self.estimate_key = None
+                self.estimate_timer.stop()
+                self.size_estimate.setText('预计输出容量：等待编码器检测完成')
                 self.start_button.setEnabled(False)
                 return
             infos = self.ordered_infos()
-            p = create_plan(infos, self.options(), self.capabilities)
-            self.strategy.setText(f'{len(infos)} 段 · 总时长 {sum(i.duration_us for i in infos) / 1e6:.1f} 秒 · {p.label} · {('CPU · ' if p.encoder.startswith('libx') else 'GPU · ') + p.encoder if p.encoder else '流复制（无需 GPU）'}' + ('\n' + '；'.join(p.warnings) if p.warnings else ''))
+            options = self.options()
+            plans = [create_plan([info], options, self.capabilities) for info in infos] if options.operation == 'compress' else [create_plan(infos, options, self.capabilities)]
+            p = plans[0]
+            self.strategy.setText(f'{len(infos)} 段 · 总时长 {sum(i.duration_us for i in infos) / 1e6:.1f} 秒 · {p.label} · {('CPU · ' if is_cpu(p.encoder) else 'GPU · ') + p.encoder if p.encoder else '流复制（无需 GPU）'}' + ('\n' + '；'.join(p.warnings) if p.warnings else ''))
+            devices = dual_devices(p, self.queue.nvenc_devices)
+            if len(devices) == 2:
+                self.strategy.setText(f'{len(infos)} 段 · 双 GPU #{devices[0]} / #{devices[1]} · {p.encoder} · 分为两个连续区间并行编码，最后复制视频流拼接')
+                if p.warnings:
+                    self.strategy.setText(self.strategy.text() + '\n' + '；'.join(p.warnings))
+            elif p.options.dual_gpu:
+                self.strategy.setText(self.strategy.text() + '\n双卡条件未满足，本任务单路处理。')
+            if options.operation == 'compress':
+                dual_count = sum(len(dual_devices(plan, self.queue.nvenc_devices)) == 2 for plan in plans)
+                self.strategy.setText(f'独立压缩 {len(infos)} 个视频 → {len(infos)} 个输出文件；逐个处理，每个文件可由双 GPU 转码（当前 {dual_count} 个符合条件）。\n' + '；'.join(dict.fromkeys(w for plan in plans for w in plan.warnings)))
+            self.update_estimate(infos, plans, options.operation)
             self.start_button.setEnabled(True)
-        except (ValueError, TypeError) as error:
+        except (ValueError, TypeError, OSError) as error:
+            self.estimate_key = None
+            self.estimate_timer.stop()
+            self.size_estimate.setText('预计输出容量：请先完成有效的输入和参数设置')
             self.strategy.setText(str(error))
             self.start_button.setEnabled(False)
 
+    def reorder_inputs(self, order):
+        selected = {index.row() for index in self.table.selectionModel().selectedRows()}
+        rows = [self.model.takeRow(0) for _ in range(self.model.rowCount())]
+        for old in order:
+            self.model.appendRow(rows[old])
+        selection = self.table.selectionModel()
+        for new, old in enumerate(order):
+            if old in selected:
+                selection.select(self.model.index(new, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        self.update_plan()
+
+    def sort_inputs(self, descending=False):
+        collator = QCollator(QLocale('zh_CN'))
+        collator.setNumericMode(True)
+        collator.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        order = sorted(range(self.model.rowCount()), key=cmp_to_key(lambda a, b: collator.compare(self.model.item(a, 0).text(), self.model.item(b, 0).text())), reverse=descending)
+        self.reorder_inputs(order)
+
+    def move_to(self):
+        selected = sorted(i.row() for i in self.table.selectionModel().selectedRows())
+        if not selected:
+            QMessageBox.information(self, '调整顺序', '请先选中要移动的视频，可多选。')
+            return
+        target, ok = QInputDialog.getInt(self, '移动到序号', '所选视频整体移动后，第一项的序号：', selected[0] + 1, 1, self.model.rowCount() - len(selected) + 1)
+        if ok:
+            remaining = [r for r in range(self.model.rowCount()) if r not in selected]
+            self.reorder_inputs(remaining[:target - 1] + selected + remaining[target - 1:])
+            self.table.scrollTo(self.model.index(target - 1, 0))
+
     def move(self, direction):
-        rows = sorted({i.row() for i in self.table.selectionModel().selectedRows()}, reverse=direction > 0)
-        for row in rows:
+        selected = {i.row() for i in self.table.selectionModel().selectedRows()}
+        order = list(range(self.model.rowCount()))
+        for row in sorted(selected, reverse=direction > 0):
             target = row + direction
-            if 0 <= target < self.model.rowCount():
-                self.model.insertRow(target, self.model.takeRow(row))
-                self.table.selectRow(target)
+            if 0 <= target < len(order) and order[target] not in selected:
+                order[row], order[target] = order[target], order[row]
+        self.reorder_inputs(order)
+
+    def update_estimate(self, infos, plans, operation):
+        key = (tuple((str(i.path), i.size_bytes, i.path.stat().st_mtime_ns) for i in infos), repr(plans), operation)
+        if key == self.estimate_key:
+            return
+        self.estimate_key = key
+        self.estimate_timer.stop()
+        groups = [[i] for i in infos] if operation == 'compress' else [infos]
+        values = [estimate_bytes(group, plan) for group, plan in zip(groups, plans)]
+        if all(value is not None for value in values):
+            kind = '流复制估算' if plans[0].mode == 'stream_copy' else '按码率估算，实际可能偏离'
+            self.size_estimate.setText(f'预计输出总容量：{sum(values) / 1048576:.2f} MiB（{kind}）')
+        else:
+            self.size_estimate.setText('预计输出总容量：等待短片段试编码…')
+            self.estimate_timer.start(1000)
+
+    def start_estimate(self):
+        if self.closing or self.estimate_key is None:
+            return
+        if self.estimate_busy or (self.queue and self.queue.active):
+            self.size_estimate.setText('预计输出总容量：等待当前任务完成后试编码')
+            self.estimate_timer.start(1000)
+            return
+        try:
+            infos, options = self.ordered_infos(), self.options()
+            plans = [create_plan([i], options, self.capabilities) for i in infos] if options.operation == 'compress' else create_plan(infos, options, self.capabilities)
+        except (ValueError, TypeError):
+            return
+        key = self.estimate_key
+        self.estimate_busy = True
+        self.size_estimate.setText('预计输出总容量：正在对 3 个短片段试编码…')
+        def done(value, error):
+            self.estimate_busy = False
+            self.works = [work for work in self.works if not work.complete]
+            if key != self.estimate_key or self.closing:
+                return
+            if self.queue.active:
+                self.estimate_key = None
+                self.size_estimate.setText('预计输出容量：任务完成后重新估算')
+                return
+            if error:
+                self.size_estimate.setText('预计输出总容量：试编码未完成，可用目标码率估算；修改参数后重试')
+                self.size_estimate.setToolTip(error)
+            else:
+                self.size_estimate.setText(f'预计输出总容量：约 {value / 1048576:.2f} MiB（3 段试编码推算，场景差异可能造成较大偏差）')
+                self.size_estimate.setToolTip('使用当前编码参数抽取时间线 20%、50%、80% 附近各最多 2 秒，仅生成临时样本，完成即清理。恒定质量无法保证固定容量。')
+        self.works.append(background(self.pool, lambda: sample_estimate(self.queue.ffmpeg, self.probe.executable, infos, plans, cancelled=lambda: self.closing or key != self.estimate_key or bool(self.queue.active)), done))
 
     def remove_inputs(self):
         for row in sorted({i.row() for i in self.table.selectionModel().selectedRows()}, reverse=True):
@@ -533,6 +812,11 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.model.item(index.row(), 0).data(Qt.ItemDataRole.UserRole)))
 
     def choose_output(self):
+        if self.operation.currentData() == 'compress':
+            folder = QFileDialog.getExistingDirectory(self, '选择压缩输出文件夹', self.output.text())
+            if folder:
+                self.output.setText(folder)
+            return
         path, _ = QFileDialog.getSaveFileName(self, '选择输出位置（已有文件会自动编号）', self.output.text(), '视频 (*.mp4 *.mkv)', options=QFileDialog.Option.DontConfirmOverwrite)
         if path:
             self.output.setText(path)
@@ -543,9 +827,12 @@ class MainWindow(QMainWindow):
             infos, options = self.ordered_infos(), self.options()
             if not self.output.text().strip():
                 raise ValueError('请选择输出路径')
-            create_plan(infos, options, self.capabilities)
+            requests = output_requests(infos, options, self.output.text().strip())
+            for inputs, _ in requests:
+                create_plan(inputs, options, self.capabilities)
             atomic_json(self.config_path, {'schemaVersion': 1, 'output': asdict(options)})
-            record = self.queue.add(infos, options, self.output.text().strip())
+            for inputs, output in requests:
+                record = self.queue.add(inputs, options, output)
             self.select_job(record['id'])
         except (ValueError, OSError) as error:
             QMessageBox.warning(self, '无法开始', str(error))
@@ -710,6 +997,7 @@ class MainWindow(QMainWindow):
         self.detail.setText(detail)
 
     def on_idle(self):
+        self.update_timer.start(100)
         if self.closing:
             self.close()
 
@@ -723,7 +1011,7 @@ class MainWindow(QMainWindow):
         import sys
         root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent.parent))
         notices = root / 'THIRD_PARTY_NOTICES.md'
-        view.setMarkdown(notices.read_text(encoding='utf-8') if notices.exists() else '视频合并压缩 0.1.3 · 本地离线处理')
+        view.setMarkdown(notices.read_text(encoding='utf-8') if notices.exists() else '视频合并压缩 0.1.7 · 本地离线处理')
         layout.addWidget(view)
         dialog.exec()
 

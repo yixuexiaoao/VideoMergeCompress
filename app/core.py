@@ -7,12 +7,24 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field
+import tempfile
+from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
 EXTENSIONS = {'.mp4', '.mov', '.mkv', '.avi', '.mts', '.m2ts', '.webm', '.ts', '.m4v'}
-ENCODERS = ['libx264', 'libx265'] + [f'{c}_{h}' for h in ('nvenc', 'qsv', 'amf', 'videotoolbox') for c in ('h264', 'hevc')]
+CPU_ENCODERS = {'h264': 'libx264', 'hevc': 'libx265', 'av1': 'libsvtav1'}
+
+
+def is_cpu(encoder):
+    return encoder in CPU_ENCODERS.values()
+
+
+def encoder_codec(encoder):
+    return next((codec for codec, name in CPU_ENCODERS.items() if name == encoder), (encoder or 'h264').split('_')[0])
+
+
+ENCODERS = list(CPU_ENCODERS.values()) + ['av1_nvenc'] + [f'{c}_{h}' for h in ('nvenc', 'qsv', 'amf', 'videotoolbox') for c in ('h264', 'hevc')]
 VIDEO_KEYS = ('codec_name', 'profile', 'level', 'width', 'height', 'pix_fmt', 'sample_aspect_ratio', 'color_space', 'color_primaries', 'color_transfer', 'color_range', 'time_base', 'has_b_frames', 'extradata_hash')
 AUDIO_KEYS = ('codec_name', 'sample_rate', 'channels', 'channel_layout', 'time_base', 'extradata_hash')
 
@@ -109,19 +121,22 @@ class ProbeService:
 
 @dataclass
 class Options:
+    operation: str = 'merge'
     container: str = 'mp4'
     preset: str = 'balanced'
     codec: str = 'auto'
     encoder: str = 'auto'
+    encoder_speed: str = 'auto'
     prefer_gpu: bool = True
+    dual_gpu: bool = True
     width: int = 0
     height: int = 0
     fps: str = ''
     quality_mode: str = 'quality'
-    quality: int = 23
+    quality: int = 26
     bitrate: int = 4000
     target_mib: int = 100
-    audio_bitrate: int = 160
+    audio_bitrate: int = 128
     sample_rate: int = 48000
     keep_channels: bool = False
     subtitle_mode: str = 'ignore'
@@ -131,16 +146,18 @@ class Options:
     keep_temp: bool = False
 
     def validate(self):
-        allowed = {'container': ('mp4', 'mkv'), 'preset': ('copy', 'fast', 'balanced', 'compact', 'custom'),
-                   'codec': ('auto', 'h264', 'hevc'), 'encoder': ['auto'] + ENCODERS,
+        allowed = {'operation': ('merge', 'compress'), 'container': ('mp4', 'mkv'), 'preset': ('copy', 'fast', 'balanced', 'best', 'compact', 'custom'),
+                   'encoder_speed': ('auto', 'fast', 'balanced', 'compact'), 'codec': ('auto', 'h264', 'hevc', 'av1'), 'encoder': ['auto'] + ENCODERS,
                    'quality_mode': ('quality', 'bitrate', 'size'), 'subtitle_mode': ('ignore', 'copy', 'burn'),
                    'rotation_mode': ('bake', 'metadata'), 'hdr_mode': ('ask', 'preserve', 'sdr')}
+        if not isinstance(self.dual_gpu, bool):
+            raise ValueError("双 GPU 必须为开关值")
         if not isinstance(self.prefer_gpu, bool):
             raise ValueError('优先 GPU 必须为开关值')
         for key, values in allowed.items():
             if getattr(self, key) not in values:
                 raise ValueError(f'无效设置：{key}')
-        for key, low, high in [('quality', 0, 51), ('audio_bitrate', 64, 512), ('bitrate', 100, 1000000),
+        for key, low, high in [('quality', 0, 63 if self.codec == 'av1' or encoder_codec(self.encoder) == 'av1' else 51), ('audio_bitrate', 64, 512), ('bitrate', 100, 1000000),
                                ('target_mib', 1, 10000000), ('subtitle_track', 0, 100)]:
             value = getattr(self, key)
             if not isinstance(value, int) or not low <= value <= high:
@@ -190,10 +207,26 @@ class ExecutionPlan:
                 'filter_concat_encode': '将统一格式并压缩，只转码一次'}[self.mode]
 
 
+TEMPLATE_QUALITY = {'best': 23, 'balanced': 26, 'compact': 28}
+
+
+def template_options(options):
+    if options.preset not in TEMPLATE_QUALITY:
+        return options
+    return replace(options, codec='h264',
+                   quality=TEMPLATE_QUALITY[options.preset], audio_bitrate=128,
+                   encoder_speed='fast' if options.encoder_speed == 'auto' else options.encoder_speed)
+
+
 def create_plan(infos: list[MediaInfo], o: Options, capabilities: list[str], force_filter=False) -> ExecutionPlan:
     o.validate()
+    o = template_options(o)
     if not infos:
         raise ValueError('请先添加视频')
+    if o.operation == 'compress' and len(infos) != 1:
+        raise ValueError('独立压缩每个任务只能包含一个输入视频')
+    if o.operation == 'compress' and o.preset == 'copy':
+        raise ValueError('独立压缩请选择压缩级别，不能使用无损流复制')
     same = compatible(infos)
     hdr = any(i.hdr for i in infos)
     copy = o.preset == 'copy' and (o.codec == 'auto' or o.codec == infos[0].video.get('codec_name')) and same and copy_container_ok(infos[0], o.container) and not (
@@ -205,8 +238,8 @@ def create_plan(infos: list[MediaInfo], o: Options, capabilities: list[str], for
         raise ValueError('HDR/SDR 或不同 HDR 格式混合，请明确选择转为 SDR')
     if o.rotation_mode == 'metadata' and not same:
         raise ValueError('仅保留旋转元数据要求输入参数一致；混合素材请选择烘焙方向')
-    codec = 'hevc' if o.preset == 'compact' or preserve_hdr else ('h264' if o.codec == 'auto' else o.codec)
-    cpu = 'libx265' if codec == 'hevc' else 'libx264'
+    codec = 'hevc' if preserve_hdr else ('h264' if o.codec == 'auto' else o.codec)
+    cpu = CPU_ENCODERS[encoder_codec(o.encoder) if o.encoder != 'auto' else codec]
     encoder = o.encoder
     warnings = []
     if encoder == 'auto':
@@ -217,12 +250,12 @@ def create_plan(infos: list[MediaInfo], o: Options, capabilities: list[str], for
     if preserve_hdr:
         encoder = 'libx265'
         warnings.append('保留 HDR 当前使用 CPU HEVC Main10；GPU 可用不代表此模式已启用 GPU')
-    elif not copy and encoder.startswith('libx') and o.encoder == 'auto' and o.prefer_gpu:
+    elif not copy and is_cpu(encoder) and o.encoder == 'auto' and o.prefer_gpu:
         warnings.append('此编码格式没有通过自检的 GPU 编码器，已使用 CPU；请查看 GPU 诊断')
     if not copy and encoder not in capabilities:
         raise ValueError(f'本机缺少可用的 {encoder} 编码器')
     if encoder in ENCODERS:
-        codec = 'hevc' if encoder == 'libx265' or encoder.startswith('hevc_') else 'h264'
+        codec = encoder_codec(encoder)
     w, h = infos[0].display_size if o.rotation_mode == 'bake' else (int(infos[0].video['width']), int(infos[0].video['height']))
     w, h = (o.width, o.height) if o.width else (w, h)
     w, h = w // 2 * 2, h // 2 * 2
@@ -260,11 +293,14 @@ def concat_text(paths: list[Path]) -> str:
 
 def encoder_args(encoder: str, quality: int, bitrate: int | None, preset: str) -> list[str]:
     args = ['-c:v', encoder]
-    if encoder.startswith('libx'):
-        args += ['-preset', {'fast': 'veryfast', 'compact': 'slow'}.get(preset, 'medium')]
+    if encoder == 'libsvtav1':
+        args += ['-preset', {'fast': '10', 'compact': '6', 'best': '6'}.get(preset, '8'), '-svtav1-params', 'lp=4']
+        args += ['-b:v', f'{bitrate}k'] if bitrate else ['-crf', str(quality)]
+    elif encoder.startswith('libx'):
+        args += ['-preset', {'fast': 'veryfast', 'compact': 'slow', 'best': 'slow'}.get(preset, 'medium')]
         args += ['-b:v', f'{bitrate}k'] if bitrate else ['-crf', str(quality)]
     elif encoder.endswith('_nvenc'):
-        args += ['-preset', {'compact': 'p6', 'balanced': 'p5'}.get(preset, 'p4'), '-rc', 'vbr', '-b:v', f'{bitrate}k' if bitrate else '0']
+        args += ['-preset', {'compact': 'p6', 'balanced': 'p5', 'best': 'p6'}.get(preset, 'p4'), '-rc', 'vbr', '-b:v', f'{bitrate}k' if bitrate else '0']
         if not bitrate:
             args += ['-cq', str(quality)]
     elif encoder.endswith('_qsv'):
@@ -302,7 +338,7 @@ def video_filter(p: ExecutionPlan, info: MediaInfo):
 def build_command(ffmpeg: str, p: ExecutionPlan, infos: list[MediaInfo], temp: Path, partial: Path) -> tuple[list[str], dict[str, str]]:
     """Pure builder: return arguments and sidecar contents; never start a process."""
     o = p.options
-    args = [ffmpeg, '-hide_banner', '-y', '-loglevel', 'warning', '-filter_complex_threads', '2']
+    args = [ffmpeg, '-hide_banner', '-nostdin', '-y', '-loglevel', 'warning', '-filter_complex_threads', '2']
     files = {'concat.ffconcat': concat_text([i.path for i in infos])}
     if p.mode != 'filter_concat_encode':
         if o.rotation_mode == 'metadata':
@@ -330,9 +366,7 @@ def build_command(ffmpeg: str, p: ExecutionPlan, infos: list[MediaInfo], temp: P
         args += ['-/filter_complex', str(temp / 'filters.txt'), '-map', '[v]', '-map', '[a]']
     if p.mode != 'stream_copy':
         quality = o.quality
-        if o.preset != 'custom':
-            quality = 28 if o.preset == 'compact' else (27 if p.encoder == 'libx265' or p.encoder.startswith('hevc_') else 23)
-        args += encoder_args(p.encoder, quality, p.bitrate, o.preset)
+        args += encoder_args(p.encoder, quality, p.bitrate, o.preset if o.encoder_speed == 'auto' else o.encoder_speed)
         args += ['-c:a', 'aac', '-b:a', f'{o.audio_bitrate}k', '-ar', str(o.sample_rate), '-ac', str(p.channels), '-map_metadata', '-1', '-map_chapters', '-1']
         args += ['-metadata:s:v:0', f'rotate={rotation(infos[0].video) if o.rotation_mode == "metadata" else 0}']
         if p.encoder == 'libx265' or p.encoder.startswith('hevc_'):
@@ -392,7 +426,7 @@ def validate_output(probe: ProbeService, path: Path, infos: list[MediaInfo], p: 
     if (p.mode == 'filter_concat_encode' or any(i.audio for i in infos)) and not out.audio:
         raise ValueError('输出音轨缺失')
     if p.mode != 'stream_copy':
-        codec = 'hevc' if p.encoder == 'libx265' or p.encoder.startswith('hevc_') else 'h264'
+        codec = encoder_codec(p.encoder)
         if (int(out.video['width']), int(out.video['height'])) != (p.width, p.height) or out.video.get('codec_name') != codec:
             raise ValueError('输出尺寸或编码校验失败')
         if abs(float(out.fps) - float(Fraction(p.fps))) > .02:
@@ -461,3 +495,58 @@ def atomic_json(path: Path, data: dict):
         f.flush()
         os.fsync(f.fileno())
     os.replace(temp, path)
+
+
+def output_requests(infos, options, output):
+    """Expand independent compression before enqueueing; never combine its inputs."""
+    if options.operation == 'merge':
+        return [(infos, Path(output))]
+    folder = Path(output)
+    if not folder.is_dir():
+        raise ValueError('独立压缩的输出位置必须是现有文件夹')
+    return [([info], folder / (info.path.stem + '_compressed.' + options.container)) for info in infos]
+
+
+def estimate_bytes(infos, plan):
+    """Rate-based estimate; quality mode requires measured sample packets."""
+    if plan.mode == 'stream_copy':
+        return sum(info.size_bytes for info in infos)
+    if plan.bitrate is None:
+        return None
+    audio = plan.options.audio_bitrate if plan.mode == 'filter_concat_encode' or any(i.audio for i in infos) else 0
+    return sum(i.duration_us for i in infos) / 1e6 * (plan.bitrate + audio) * 1000 / 8 * 1.02
+
+
+def sample_estimate(ffmpeg, ffprobe, infos, plan, cancelled=lambda: False):
+    total = sum(i.duration_us for i in infos) / 1e6
+    plans = plan if isinstance(plan, list) else [plan] * len(infos)
+    rates = []
+    # ponytail: three timeline samples; use more samples if scene variation demands it.
+    with tempfile.TemporaryDirectory(prefix='vmc-estimate-') as directory:
+        folder = Path(directory)
+        for fraction in (.2, .5, .8):
+            if cancelled():
+                raise ValueError('参数已更新或任务已开始，已停止旧样本估算')
+            position = total * fraction
+            for info, plan in zip(infos, plans):
+                duration = info.duration_us / 1e6
+                if position < duration:
+                    break
+                position -= duration
+            seconds = min(2., duration)
+            offset = max(0., min(position, duration - seconds))
+            sample = replace(info, duration_us=round(seconds * 1e6))
+            options = replace(plan.options, subtitle_mode='ignore' if plan.options.subtitle_mode == 'copy' else plan.options.subtitle_mode)
+            local = replace(plan, mode='concat_encode', options=options)
+            output = folder / ('sample.' + options.container)
+            args, files = build_command(ffmpeg, local, [sample], folder, output)
+            start, end = args.index('-protocol_whitelist'), args.index('-i') + 2
+            args[start:end] = ['-protocol_whitelist', 'file,pipe,crypto,data', '-ss', str(offset), '-i', str(info.path)]
+            capture(args, timeout=20)
+            packets = json.loads(capture([ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_packets',
+                                         '-show_entries', 'packet=size', '-of', 'json', str(output)], timeout=10))['packets']
+            if not packets:
+                raise ValueError('试编码未产生视频数据')
+            audio = plan.options.audio_bitrate * 1000 / 8 if plan.mode == 'filter_concat_encode' or info.audio else 0
+            rates.append(sum(int(packet['size']) for packet in packets) / seconds + audio)
+    return sum(rates) / len(rates) * total * 1.02
