@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install build tools
-        run: choco install innosetup ffmpeg -y --no-progress
+        run: choco install innosetup ffmpeg-full -y --no-progress
       - name: Stage FFmpeg and licenses
         shell: pwsh
         run: |
