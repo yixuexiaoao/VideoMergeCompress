@@ -294,7 +294,7 @@ def concat_text(paths: list[Path]) -> str:
 def encoder_args(encoder: str, quality: int, bitrate: int | None, preset: str) -> list[str]:
     args = ['-c:v', encoder]
     if encoder == 'libsvtav1':
-        args += ['-preset', {'fast': '10', 'compact': '6', 'best': '6'}.get(preset, '8'), '-svtav1-params', 'lp=4']
+        args += ['-preset', {'fast': '10', 'compact': '6', 'best': '6'}.get(preset, '8')]
         args += ['-b:v', f'{bitrate}k'] if bitrate else ['-crf', str(quality)]
     elif encoder.startswith('libx'):
         args += ['-preset', {'fast': 'veryfast', 'compact': 'slow', 'best': 'slow'}.get(preset, 'medium')]
